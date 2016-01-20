@@ -1,0 +1,230 @@
+---
+title: "Weight Lifting Exercise Prediction"
+author: "Tim Sloan"
+date: "15 January 2016"
+output: html_document
+---
+
+# Executive summary
+
+The [Weight Lifting Exercises Dataset](http://groupware.les.inf.puc-rio.br/har) was collected from participants wearing
+sensors during a weight training session. Data are labelled according to whether the exercises were performed correctly or not.
+After tidying up the data, 52 variables were identified, representing measurements from the arm, forearm, belt and dumbbell for
+the following sensor values: roll, pitch, yaw, magnet(xyz), gyros(xyz), acceleration(xyz) and total acceleration.
+Exploratory analysis suggested that the belt sensors, excluding gyros, may be more discriminatory than other variables, but that
+the majority of variables appeared to be providing useful information.  
+
+The data was split into training, cross-validation and test sets at a proportion of 60:20:20. Models were trained with random
+forest (rf), linear discrimination analysis (lda) and stochastic gradient boosting (gbm). Of these, random forest was the most
+accurate (99%) on the cross-validation data. Preprocessing with PCA reduced rf accuracy to 96%. Using fewer variables, selected
+from exploratory data analysis reduced accuracy slightly; 95% with 11 variables and 98% with 26 variables.  
+
+Given the minimal impact on accuracy, but potential gains in performance, the 26 variable random forest model was selected for
+use on the test set with 98% accuracy as expected and then deployed on the 20 question quiz with 100% success.
+
+
+# Data cleaning
+
+The required libraries were loaded and datasets downloaded from the URL provided.
+
+```{r load_data}
+
+library(dplyr)
+library(caret)
+library(ggplot2)
+library(parallel)
+library(doParallel)
+
+if(!file.exists("weight_train.csv")){
+        download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv","weight_train.csv")
+}
+if(!file.exists("weight_test.csv")){
+        download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv","weight_test.csv")
+}
+
+wt_train <- read.csv("weight_train.csv",na.strings=c("","NA"))
+wt_test <- read.csv("weight_test.csv",na.strings=c("","NA"))
+```
+
+Several variables were found to mostly contain missing data, with only summary values for aggregated value windows. These were
+removed, along with the subject and time variables so that solely the sensor data could be used to train the model. This was
+constrained by the format of the test data for the assignment, which requires testing on individual values, not the entire
+exercise window as used by the dataset authors for their publication.
+
+Tabulating the final 52 values shows the 12 individual values for each position (arm, forearm, belt and dumbbell) along
+with the four total acceleration values for each position. The 12 values were: roll, pitch, yaw, accel(xyz), magnet(xyz)
+and gyros(xyz).
+
+```{r tidy_data}
+
+
+na.fields <- lapply(wt_train, function(x) {sum(is.na(x))})
+rm.na <- wt_train[na.fields==0]
+tidy <- select(rm.na, -c(1:7))
+
+labels <- as.factor(sapply(names(tidy), function(x) {strsplit(x,"_")[[1]][2]}))[1:52]
+table(labels) #roll, pitch, yaw, accel(xyz), magnet(xyz), gyros(xyz), totel_accel = 13 * 4 (arm, forearm, belt, dumbbell)
+```
+
+# Data partitions
+
+60% of the data was reserved for model training, a further 20% for cross-validation and algorithm selection and a final 20%
+for testing the optimal algorithm and estimation of the out of sample error rate.
+
+```{r partition_data}
+set.seed(32323)
+part <- createDataPartition(tidy$classe, p=0.6, list=FALSE)
+train <- tidy[part,]
+heldout <- tidy[-part,]
+part2 <- createDataPartition(heldout$classe, p=0.5, list=FALSE)
+cv <- heldout[part2,]
+test <- heldout[-part2,]
+
+rm(list=c("wt_train","rm.na","tidy","part","part2","heldout")) #tidy up workspace
+```
+
+# Exploratory data analysis
+
+Variables were analysed to look for promising candidates. None of the variables exhibited zero-variance, and as shown in figure
+1, the vast majority were uncorrelated or weakly correlated.
+
+```{r exploratory_analysis1}
+
+table(sapply(train[,-53],var)>0.001)
+
+scaled <- scale(train[,-53])
+corr <- cor(scaled)
+hist(corr[corr<1], main = "Figure 1 : Variable correlation",xlab="Correlation")
+```
+
+In an attempt to look for variables which distinguished well between the exercise classes, the data was scaled to uniform mean
+and SD, and the widest gap between class medians was calculated for each variable. This indicated that many of the gyros sensor
+readings appeared to discriminate poorly between classes, where as other values, particularly belt acceleration and arm magnets
+appeared to discriminate well.
+
+```{r exploratory_analysis2}
+
+mdif <- sapply(data.frame(scaled), function(x){
+    temp <- tapply(x, train$classe, median)
+    (max(temp) - min(temp))
+})
+
+mdif[mdif<0.2]
+mdif[mdif>1.0]
+```
+
+To confirm this visually, selected boxplots are shown in Figure 2 below for 2 variables with a large median difference (belt roll
+and arm magnet x-axis) and 2 variables with a small median difference (forearm gyros z-axis and arm yaw). Subsets of the training
+data with fewer variables were created with a median range cutoff of 1 (11 variables) and 0.42 (26 variables, half the total) for
+use later on in model selection.  
+
+
+## Figure 2: Variables with a large and small range of class medians
+
+```{r exploratory_analysis3}
+
+par(mfrow=c(2,2))
+boxplot(data=train, roll_belt~classe, ylab="Belt roll", col="salmon", main="Scaled median difference = 2.0")
+boxplot(data=train, magnet_arm_x~classe, ylab="Arm magnet x-axis", col="light blue", main="Scaled median difference = 1.8")
+boxplot(data=train, gyros_forearm_z~classe, ylab="Forearm gyros z-axis", col="blue", main="Scaled median difference = 0.07")
+boxplot(data=train, yaw_arm~classe, ylab="Arm yaw", col="blue", main="Scaled median difference = 0")
+
+mini_train <- train[,mdif>1]
+midi_train <- train[,mdif>0.42]
+```
+
+Before beginning to train the models, PCA analysis was also conducted to look at the variance in the data. As shown in figure 3,
+the first two principal components explained roughly 15% of the variance each, for a total of 30%. PC1 seemed to discriminate
+better between classes. Plotting the variable weighting for PC1 coloured by sensor position appeared to indicate that the arm and
+belt sensors had the largest positive and negative weightings on PC1. The potential importance of the belt sensors is consistent
+with the analysis above.
+
+
+## Figure 3: Results of Principal Components Analysis
+
+```{r exploratory_analysis4}
+
+pca <- prcomp(t(scaled))
+
+par(mfrow=c(2,2))
+plot(train$classe, pca$rotation[,1], ylab="Values",main="1st Principal Component")
+plot(train$classe, pca$rotation[,2], ylab="Values",main="2nd Principal Component")
+plot(pca$sdev^2/sum(pca$sdev^2), ylab="Proportion",xlab="Principal Components",main="Variance explained")
+plot(pca$x[,1], col=labels, ylab="Weighting", xlab="Sensor variables",main="Contribution to 1st PC",xlim=c(0,70))
+legend("topright", legend=levels(labels), pch=20, col=c(1:5), cex=0.4)
+
+```
+
+# Model selection
+
+Three algorithms were initially tested against all 52 variables from the training data. Random forest and schochastic gradient
+boosting were chosen as these algorithms are widely used and perform well for most applications. Linear discriminant analysis was
+also tested as a lighter weight and quicker to train algorithm. Because of slow training times for the random forest model, the
+following code makes use of parallel processing to speed up training. k-fold cross validation was also used for estimation of the
+model error rate, rather than bootstrapping, as this also greatly speeds up training time.
+
+```{r train_model, cache=TRUE}
+
+clusters <- makeCluster(detectCores()-1)
+registerDoParallel(clusters)
+
+tr_params <- trainControl(method="cv",number=10,allowParallel = TRUE)
+
+# Train models
+modelFit <- train(train$classe~.,method="rf",data=train,trControl=tr_params) #99%
+modelFit2 <- train(train$classe~.,method="lda",data=train,trControl=tr_params) #71% 
+modelFit3 <- train(train$classe~.,method="gbm",data=train,trControl=tr_params,verbose=FALSE) #96%
+
+stopCluster(clusters)
+
+# Test models on cross validation data
+results <- predict(modelFit, newdata=cv)
+results2 <- predict(modelFit2, newdata=cv)
+results3 <- predict(modelFit3, newdata=cv)
+
+# Generate confusion matrices and estimate accuracy
+confusionMatrix(cv$classe, results)$overall[1] # random forest 99%
+confusionMatrix(cv$classe, results2)$overall[1] # linear discriminant analysis 70%
+confusionMatrix(cv$classe, results3)$overall[1] # stochastic gradient boosting 96%
+```
+
+Random forest was the top performing algorithm, with an accuracy of 99%. This was also the most demanding
+algorithm, taking about 15-20 minutes to run on my laptop. In an attempt to reduce CPU load without sacrificing
+too much accuracy, three more models were trained: preprocessing with PCA, the top 11 variables from exploratory analysis
+and the top 26 variables from exploratory analysis. These were also tested on the cross-validation set.
+
+```{r train_model2, cache=TRUE}
+
+clusters <- makeCluster(detectCores()-1)
+registerDoParallel(clusters)
+
+modelFit4 <- train(train$classe~.,method="rf",data=train,trControl=tr_params, preProcess="pca") #96%
+modelFit5 <- train(train$classe~., method="rf", data=mini_train, trControl=tr_params) #95%
+modelFit6 <- train(train$classe~., method="rf", data=midi_train, trControl=tr_params) #98%
+
+stopCluster(clusters)
+
+results4 <- predict(modelFit4, newdata=cv)
+results5 <- predict(modelFit5, newdata=cv)
+results6 <- predict(modelFit6, newdata=cv)
+
+confusionMatrix(cv$classe, results4)$overall[1] # rf with pca 98%
+confusionMatrix(cv$classe, results5)$overall[1] # rf with 11 variables 96%
+confusionMatrix(cv$classe, results6)$overall[1] # rf with 26 variables 99%
+```
+
+Pre-processing with PCA lost some accuracy (97.6%) but without further reducing the variance threshold, did not speed
+up model training. The model with 11 variables had a greater loss in accuracy, but the 26 variable model was virtually
+comparable in performance to the full 52 variables, so this was selected as the final model to use on the test set.
+
+```{r test}
+
+final <- predict(modelFit6, newdata=test)
+confusionMatrix(test$classe, final) #98.4%
+
+test_result <- predict(modelFit6, newdata=wt_test) #100% on quiz
+test_result
+```
+
+The expected out of sample error rate, from testing on the 20 % test partition, was 98%. Taking this model and predicting class
+values on the 20 quiz questions resulted in a 100 % score.
